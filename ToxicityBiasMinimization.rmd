@@ -1,0 +1,681 @@
+---
+title: "STAT 471: Modern Data Mining Final Project"
+author:
+- Eric Shan
+- Jia Wei Teo
+- Rachel Leong
+output:
+  html_document:
+    code_folding: show
+    highlight: haddock
+    theme: lumen
+    toc: yes
+    toc_depth: 4
+    toc_float: yes
+  pdf_document:
+    toc: yes
+    toc_depth: '4'
+  word_document:
+    toc: yes
+    toc_depth: '4'
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(fig.height=4, fig.width=6, warning = F)
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(readr,stringr,car, randomForest, tree, ISLR, rpart, rattle, pROC, partykit, ggplot2, glmnet, leaps, dplyr, gbm, reshape, wordcloud,neuralnet, keras, tensorflow, stringr)
+
+library(data.table)
+library(tm)
+library(RColorBrewer)
+library(wordcloud)
+library(ranger)
+library(corrplot)
+set.seed(471)
+```
+
+```{r}
+train = read.csv("~/Downloads/jigsaw-unintended-bias-in-toxicity-classification/train.csv")
+
+# load cleaned data (for when RStudio crashes)
+# train = read.csv("train_cleaned.csv")
+```
+
+## Data Cleaning 
+
+```{r}
+# clean data
+
+# drop irrelevant columns
+drop = c("created_date", "publication_id", "parent_id", "article_id", "severe_toxicity", "obscene", "threat",
+                                        "insult", "identity_attack", "sexual_explicit", "toxicity_annotator_count", 
+                                        "identity_annotator_count", "rating", "funny", "wow", "sad", "likes", "disagree")
+train = train[, !(names(train) %in% drop)]
+
+# drop na
+train = train[rowSums(is.na(train)) == 0, ]
+
+# select subset of 40000 rowa
+set.seed(471)
+n = nrow(train)
+index = sample(n, 40000)
+train = train[index,]
+
+# reset index
+rownames(train) = seq(length=nrow(train)) 
+
+# write data into csv
+#write.csv(train, file = "train_cleaned.csv")
+```
+
+
+## Exploratory Data Analysis
+
+```{r}
+summary(train)
+```
+
+```{r}
+str(train)
+```
+
+```{r}
+# check if any articles have more toxic ratings
+plot_data = train %>% filter(target >= 0.5) %>% group_by(article_id) %>% tally() %>% arrange(desc(n))
+plot_data %>% head(5)
+```
+
+```{r}
+print.data.frame(train  %>% filter(article_id == 356689) %>% select(comment_text, target) %>%  arrange(desc(target)) %>% head(8))
+```
+
+
+```{r}
+# get rows with "negative" words but actually not toxic
+train %>% filter(str_detect(comment_text, 'gay') & target == 0) %>% select(comment_text) %>% head(5)
+```
+
+```{r}
+# plot histogram of target
+ggplot(data=train, aes(target)) + ggtitle('Histogram of toxicity in comments') + 
+  geom_histogram(bins=10)
+```
+
+```{r}
+# plot histogram of number of toxic comments articles have
+ggplot(data=plot_data, aes(n)) + 
+  geom_histogram(bins=10) + ggtitle('Histogram of number of toxic comments per article')
+```
+
+
+## Create DTM
+
+```{r}
+# create corpus
+mycorpus1 = VCorpus(VectorSource(train$comment_text))
+mycorpus1
+
+inspect(mycorpus1[[1]])
+```
+
+```{r}
+# change to lowercase
+mycorpus2 = tm_map(mycorpus1, content_transformer(tolower))
+as.character(mycorpus2[[1]])
+```
+
+```{r}
+# remove stopwords
+mycorpus3 = tm_map(mycorpus2, removeWords, stopwords("english"))
+as.character(mycorpus3[[1]])
+```
+
+```{r}
+# remove punctuation
+mycorpus4 = tm_map(mycorpus3, removePunctuation)
+as.character(mycorpus4[[1]])
+```
+
+```{r}
+# remove numbers
+mycorpus5 = tm_map(mycorpus4, removeNumbers)
+as.character(mycorpus5[[1]])
+```
+
+```{r}
+# getting word stem
+mycorpus6 = tm_map(mycorpus5, stemDocument, lazy = TRUE) 
+as.character(mycorpus6[[1]])
+```
+
+```{r}
+# create dtm and remove sparse terms
+dtm2 = removeSparseTerms(DocumentTermMatrix(mycorpus6), 0.995)
+dtm2
+```
+
+```{r}
+# create factor variable for rating
+target_binary = ifelse(train$target >= 0.5, '1', '0')
+
+# create new df
+train2 = data.frame(target_binary, as.matrix(dtm2))
+str(train2)
+```
+
+```{r}
+# split into train-test
+train.index = sample(dim(train2)[1], 0.7*dim(train2)[1])
+data.train = train2[train.index,]
+data.test = train2[-train.index,]
+```
+
+```{r}
+# LASSO model
+X1 = sparse.model.matrix(target_binary~., data=data.train)[,-1]
+dim(X1)
+y = data.train$target_binary
+
+result.lasso.1 = cv.glmnet(X1, y, alpha=.99, family="binomial")
+```
+
+```{r}
+# get the beta coefficients of lambda.1se model
+beta.lasso = coef(result.lasso.1, s="lambda.1se")   
+beta = beta.lasso[which(beta.lasso !=0),]
+beta = as.matrix(beta);
+beta = rownames(beta)
+beta[2:50]
+```
+
+```{r}
+# use the lasso variables to build a linear regression model
+glm.input = as.formula(paste("target_binary", "~", paste(beta[-1],collapse = "+"))) 
+result.glm = glm(glm.input, family=binomial, data.train)
+```
+
+```{r}
+# words with positive coefficients (toxic)
+result.glm.coef = coef(result.glm)
+toxic.glm = result.glm.coef[which(result.glm.coef > 0)]
+toxic.glm = toxic.glm[-1]
+toxic.glm = sort(toxic.glm, decreasing = TRUE)
+
+toxic.glm[1:5]
+```
+
+```{r}
+cor.special = brewer.pal(9,"Reds")  # set up a pretty color scheme
+
+toxic.words = names(toxic.glm)
+wordcloud(toxic.words[c(3:50)], toxic.glm[c(3:50)],
+          colors=cor.special, ordered.colors=F)
+```
+
+```{r}
+good.glm = result.glm.coef[which(result.glm.coef < 0)]
+good.glm = good.glm[-1]
+good.glm = sort(good.glm, decreasing = FALSE)
+
+good.glm[1:5]
+```
+
+```{r}
+cor.special = brewer.pal(8,"Greens") 
+
+good.words = names(good.glm)
+wordcloud(good.words[1:20], good.glm[1:20]*-1,
+          colors=cor.special, ordered.colors=F)
+```
+
+### LDA 
+```{r}
+library(LDAvis)
+library(lda)
+library(textmineR)
+library(topicmodels)
+```
+
+
+```{r}
+burnin = 1000
+iter = 2000
+thin = 500
+nstart = 5
+best = TRUE
+k = 10
+seed = list(254672,109,122887,145629037,2)
+
+# remove sparse rows
+train.dtm = dtm2[train.index,]
+rowTotals = apply(train.dtm, 1, sum)
+dtm.new = train.dtm[rowTotals> 0, ]
+
+test.dtm = dtm2[-train.index,]
+rowTotals = apply(test.dtm, 1, sum)
+dtm.test.new = test.dtm[rowTotals> 0, ]
+
+#run the LDA model
+ldaOut = LDA(dtm.new,k, method="Gibbs", control=
+                list(nstart=nstart, seed=seed, best=best, burnin = burnin, iter = iter, thin=thin))
+```
+
+```{r}
+# check terms in topics
+terms(ldaOut,10)
+```
+
+```{r}
+library(tidytext)
+text_topics1 = tidy(ldaOut, matrix = "beta")
+text_topics1
+```
+```{r}
+# plot topics and most frequent words
+text_top_terms1 = text_topics1 %>%
+  group_by(topic) %>%
+  top_n(10, beta) %>%
+  ungroup() %>%
+  arrange(topic, -beta)
+
+text_top_terms1 %>%
+  mutate(term = reorder(term, beta)) %>%
+  ggplot(aes(term, beta, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, nrow=2, scales='free_y') +
+  coord_flip()
+```
+
+```{r}
+# predict train data topic using LDA model
+train.topics = posterior(ldaOut,dtm.new)
+#train.topics = apply(train.topics$topics, 1, which.max)
+
+index.data = as.numeric(row.names(train.topics$topics))
+new.train.data = cbind(as.integer(as.character(train2[index.data,1])), train.topics$topics)
+new.train.data = data.frame(new.train.data)
+```
+
+```{r}
+# predict test data topic using LDA model
+test.topics = posterior(ldaOut,dtm.test.new)
+#test.topics = apply(test.topics$topics, 1, which.max)
+
+index.data = as.numeric(row.names(test.topics$topics))
+new.test.data = cbind(as.integer(as.character(train2[index.data,1])), test.topics$topics)
+new.test.data = data.frame(new.test.data)
+```
+
+```{r}
+# correlation of topics
+M = cor(new.train.data)
+corrplot(M,method='color', tl.cex = 0.9, tl.col = 'black')
+```
+
+## Models
+### Logistic Regression with topic model as feature
+
+```{r}
+logit.model = glm(V1~. -X1, data=new.train.data, family='binomial')
+summary(logit.model)
+```
+
+```{r}
+# plot ROC
+fit.roc = roc(new.train.data$V1, logit.model$fitted, plot=T, col="blue", main='ROC Plot')
+```
+
+
+```{r}
+# plot AUC
+plot(1-fit.roc$specificities, fit.roc$sensitivities, col="red", pch=16,
+     xlab="False Positive", 
+     ylab="Sensitivity", 
+     main='AUC Plot')
+```
+
+```{r}
+# train prediction error
+lm.prediction = predict(logit.model, new.train.data, type = 'response')
+
+proba.list = seq(0, 1, 0.05)
+error.list = list()
+for (i in proba.list){
+  fit.pred = ifelse(lm.prediction > i, "1", "0")
+  error = sum(fit.pred != new.train.data$V1)/length(fit.pred)
+  error.list = append(error.list, error)
+}
+
+plot(proba.list, error.list, type='l', col='red', main='Plot of testing errors given probability threshold')
+```
+
+```{r}
+# minimum error
+lm.prediction.test = predict(logit.model, new.test.data, type = 'response')
+fit.pred = ifelse(lm.prediction.test > 0.55, "1", "0")
+error = sum(fit.pred != new.test.data$V1, na.rm = TRUE)/length(fit.pred)
+error
+```
+
+
+### LASSO GLM Model 
+
+Create dataframes
+
+```{r include=FALSE}
+train$toxic <- ifelse(train$target >= .5, '1', '0')
+train$toxic <- as.factor(train$toxic)
+train$text <- iconv(train$comment_text, 'UTF-8', 'ASCII')
+mycorpus1 = VCorpus(VectorSource(train$text))
+mycorpus2 <- tm_map(mycorpus1, content_transformer(tolower))
+mycorpus2%<>%
+  tm_map(removeWords, stopwords("english")) %>%
+  tm_map(removePunctuation) %>%
+  tm_map(removeNumbers) %>%
+  tm_map(stemDocument, lazy = TRUE) 
+```
+
+```{r include = FALSE}
+dtm1 = DocumentTermMatrix(mycorpus2)
+dtm2 <- removeSparseTerms(dtm1, 0.995)
+```
+
+```{r include = FALSE}
+data2 = data.frame(train$toxic, as.matrix(dtm2))
+names(data2)[1] <- 'toxic'
+```
+
+```{r include=FALSE}
+set.seed(471)
+n=nrow(data2)
+test.index <- sample(n, 0.3*n)
+#length(test.index)
+data2.test <- data2[test.index, ] # only keep rating and the texts
+data2.train <- data2[-test.index, ]
+```
+
+
+Use the training data to get Lasso fit. 
+
+```{r include=FALSE} 
+set.seed(471)
+X1 = sparse.model.matrix(toxic~., data=data2.train)[,-1]
+dim(X1)
+y = data2.train$toxic
+result.lasso.1 = cv.glmnet(X1, y, alpha=.99, family="binomial")
+#plot(result.lasso.1)
+```
+
+Choose variables with non-zero coefficients.
+```{r echo=FALSE}
+beta.lasso = coef(result.lasso.1, s="lambda.1se")   
+beta = beta.lasso[which(beta.lasso !=0),]
+beta = as.matrix(beta)
+beta = rownames(beta)
+```
+
+There are `r length(beta)` variables in the initial model.
+
+Feed the output from Lasso above, get a logistic regression. 
+
+```{r echo=FALSE}
+glm.input = as.formula(paste("toxic", "~", paste(beta[-1],collapse = "+"))) 
+result.glm = glm(glm.input, family=binomial, data2.train)
+glm.input
+summary(result.glm)
+```
+
+Note the large number of insignificant variables at alpha = 0.05. 
+
+Select only the variables that are statistically significant.
+
+```{r echo=FALSE}
+p.values1 <- as.data.frame(summary(result.glm)$coefficients) 
+colnames(p.values1)[4] <- 'pval'
+p.values1$variable <- row.names(p.values1)
+psig1 <- p.values1 %>% filter(pval <= .05) %>% select(variable)
+psig1 <- psig1[-1, ]
+psig1
+```
+
+There are `r length(psig1)` variables in the final LASSO GLM model. `r length(beta)-length(psig1)` variables have been removed.
+
+Summary of final model: 
+
+```{r echo=FALSE}
+glm3.input = as.formula(paste("toxic", "~", paste(psig1,collapse = "+"))) 
+result3.glm = glm(glm3.input, family=binomial, data2.train)
+glm3.input
+summary(result3.glm)
+```
+
+Compare training errors:
+
+```{r include=FALSE}
+predict.glm3.train = predict(result3.glm, data2.train, type ='response')
+#summary(result.glm)
+class.glm3.train = rep("0", dim(data2.train)[1])
+class.glm3.train[predict.glm3.train > .5] ="1"
+class.glm3.train<- as.factor(class.glm3.train)
+
+trainerror.glm3 = mean(data2.train$toxic != class.glm3.train)
+trainerror.glm3 
+```
+
+Final model: training error of `r trainerror.glm3`
+
+```{r include=FALSE}
+predict.glm.train = predict(result.glm, data2.train, type ='response')
+class.glm.train = rep("0", dim(data2.train)[1])
+class.glm.train[predict.glm.train > .5] ="1"
+class.glm.train <- as.factor(class.glm.train)
+trainerror.glm = mean(data2.train$toxic != class.glm.train)
+trainerror.glm 
+```
+
+Initial model: training error of `r trainerror.glm`
+
+There is no big difference in training error, but the model removes 126 variables and is a lot less complex.
+
+```{r inlcude=FALSE}
+predict.glm3 = predict(result3.glm, data2.test, type ='response')
+class.glm3 = rep("0", dim(data2.test)[1])
+class.glm3[predict.glm3 > .5] ="1"
+class.glm3 <- as.factor(class.glm3)
+
+testerror.glm3 = mean(data2.test$toxic != class.glm3)
+testerror.glm3 
+```
+
+Testing error of final model is `r testerror.glm3 `
+
+
+### Random Forest Model
+
+Find the optimal number of trees. 
+
+```{r include=FALSE}
+errors = list()
+for (ntree in seq(1,500,50)){
+  fit.rf.mtry = ranger::ranger(toxic~., data2.train, num.trees = ntree,importance="impurity", oob.error = TRUE)
+  predict.rf = predict(fit.rf.mtry, data2.train[,-1], type="response") 
+  error = fit.rf.mtry$prediction.error
+  errors = append(errors,error)
+}
+```
+
+```{r echo=FALSE}
+ntrees <- seq(1,500,50)
+ntrees.df <- cbind(ntrees, unlist(errors))
+ntrees.df <- as.data.frame(ntrees.df)
+ntrees.df %>% arrange(V2)
+```
+
+The error is minimized at 200 trees. 
+
+Then, tune mtry.
+
+```{r echo=FALSE}
+# tune mtry given ntree
+
+errors1 = list()
+for (i in seq(25,50,5)){
+  fit.rf.mtry = ranger::ranger(toxic~., data2.train, num.trees = 200, mtry=i,importance="impurity", oob.error = TRUE)
+  predict.rf = predict(fit.rf.mtry, data2.train[,-1], type="response") 
+  error = fit.rf.mtry$prediction.error
+  errors1 = append(errors1,error)
+}
+
+plot(seq(25,50,5), errors1, xlab = 'mtry', ylab= 'errors')
+```
+
+Note that mtry decreases significantly from 25 to 30, then increases at 35. Therefore, look into mtry from 27 to 33 to see which mtry is the most optimal.
+
+```{r}
+# tune mtry given ntree
+
+errors = list()
+for (i in seq(27,33)){
+  fit.rf.mtry = ranger::ranger(toxic~., data2.train, num.trees = 200, mtry=i,importance="impurity", oob.error = TRUE)
+  predict.rf = predict(fit.rf.mtry, data2.train[,-1], type="response") 
+  error = fit.rf.mtry$prediction.error
+  errors = append(errors,error)
+}
+
+plot(seq(27,33), errors, xlab= 'mtry')
+```
+
+mtry of 30 returns the smallest prediction error.
+
+Final model: ntrees = 200 and mtry = 30
+
+
+```{r include=FALSE}
+rf.final <- ranger::ranger(toxic~., data2.train, num.trees= 200, mtry = 30, importance = 'impurity', oob.error= TRUE)
+predict.rf.test <- predict(rf.final, data2.test[, -1], type = 'response')
+rf.test.error <- mean(data2.test$toxic != predict.rf.test$predictions)
+rf.test.error
+```
+
+```{r include=FALSE}
+predict.rf.train <- predict(rf.final, data2.train[, -1], type ='response')
+rf.train.error<- mean(data2.train$toxic != predict.rf.train$predictions)
+rf.train.error
+```
+
+Training error is `r rf.train.error` and testing error is `r rf.test.error`.
+
+### CNN
+
+Create the binary outcome variable. 
+```{r}
+train$mean <- ifelse(train$target >= 0.5, 1, 0)
+```
+
+Create training and testing sets (70/30 split)
+```{r}
+set.seed(471)
+ind <- sample(seq_len(nrow(train)), size = 28000)
+training <- train[ind,]
+testing <- train[-ind,]
+```
+
+Convert text to remove emoji's. 
+```{r}
+training$text <- iconv(training$comment_text, 'UTF-8', 'ASCII')
+testing$text <- iconv(testing$comment_text, 'UTF-8', 'ASCII')
+```
+
+Isolate the text data. 
+```{r}
+train_text <- training$text
+test_text <- testing$text
+```
+
+Apply the text tokenizer functions. Build the model. 
+
+```{r}
+max_features <- 1012
+tokenizer <- text_tokenizer(num_words = max_features)
+tokenizer %>% 
+  fit_text_tokenizer(train_text)
+
+text_seqs <- texts_to_sequences(tokenizer, train_text)
+text_seqs_test <- texts_to_sequences(tokenizer, test_text)
+
+maxlen <- 1012
+batch_size <- 32
+embedding_dims <- 50
+filters <- 64
+kernel_size <- 3
+hidden_dims <- 50
+epochs <- 8
+
+x_train <- text_seqs %>%
+  pad_sequences(maxlen = maxlen)
+
+y_train <- training$mean
+
+x_test <- text_seqs_test %>%
+  pad_sequences(maxlen = maxlen)
+
+y_test <- testing$mean
+
+set.seed(471)
+model <- keras_model_sequential() %>% 
+  layer_embedding(max_features, embedding_dims, input_length = maxlen) %>%
+  layer_dropout(0.2) %>%
+  layer_conv_1d(
+    filters, kernel_size, 
+    padding = "valid", activation = "relu", strides = 1
+  ) %>%
+  layer_global_max_pooling_1d() %>%
+  layer_dense(hidden_dims) %>%
+  layer_dropout(0.3) %>%
+  layer_activation("relu") %>%
+  layer_dense(1) %>%
+  layer_activation("sigmoid") %>% compile(
+  loss = "binary_crossentropy",
+  optimizer = "adam",
+  metrics = "accuracy"
+)
+
+```
+
+Fit the model and check training/validation loss/acc. 
+```{r}
+set.seed(471)
+hist <- model %>%
+  fit(
+    x_train,
+    y_train,
+    batch_size = batch_size,
+    epochs = epochs,
+    validation_split = 0.3
+  )
+
+plot(hist)
+```
+
+NOTE: I rerun the model before this (in other words, I rerun the entire chunk starting with max_features and ending with metrics).
+Fit the final model and find training and testing results. 
+
+```{r}
+model %>%
+  fit(
+    x_train,
+    y_train,
+    batch_size = batch_size,
+    epochs = 2)
+    
+results = model %>% evaluate(x_test, y_test)
+print(results)
+
+results1 = model %>% evaluate(x_train, y_train)
+print(results1)
+```
+
+
+
